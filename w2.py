@@ -23,14 +23,18 @@ cfg = {
     "url_pattern" : "https://us-central1-optune-saas-collect.cloudfunctions.net/metrics/{acct}/{app_id}/servo",
     "account" : None,
     "auth_token" : None,
-    "send_timeout" : 10
+    "send_timeout" : 10,
+    "namespaces" : "default"
 }
 
 # update from env
 cfg["url_pattern"] = os.environ.get("OPTUNE_URL",cfg["url_pattern"])
 cfg["account"] = os.environ.get("OPTUNE_ACCOUNT",cfg["account"])
 cfg["auth_token"] = os.environ.get("OPTUNE_AUTH_TOKEN",cfg["auth_token"])
+cfg["namespaces"] = os.environ.get("POD_NAMESPACES",cfg["namespaces"])
 
+# split into array for easy use
+cfg["namespaces"] = cfg["namespaces"].split(",")
 
 def k_get(namespace, qry):
     '''run kubectl get and return parsed json output'''
@@ -63,8 +67,6 @@ def k_patch_json(namespace, typ, obj, patchstr):
     r = json.loads(r)
     return r
 
-
-NAMESPACE="default" # FIXME: to become configurable
 
 def check_and_patch(obj, jobid):
     if "initializers" not in obj["metadata"]:
@@ -104,7 +106,7 @@ def get_jobid(obj):
     the expected object type is 'pod' here, but this might change.
     """
 
-    if obj["metadata"]["namespace"] != NAMESPACE:
+    if obj["metadata"]["namespace"] not in cfg["namespaces"]:
         return None
     return getenv( obj["spec"]["containers"][0].get("env", []), "JOBID" )
 
@@ -185,7 +187,7 @@ def watch1(ln):
 # TODO: temporary, not useable if we run more than one background process
 g_p = None
 
-def run_watch(namespace, v, p_line):
+def run_watch(v, p_line):
 
     api = "/api/v1" # FIXME
     qry = "pods?includeUninitialized=true&watch=1&resourceVersion="+str(v)
@@ -261,7 +263,7 @@ def watch():
         check_and_patch(p, jobid)
 
     while True:
-        r = run_watch(NAMESPACE, pods["metadata"]["resourceVersion"], watch1)
+        r = run_watch(pods["metadata"]["resourceVersion"], watch1)
         if r:
             return # exit (we'll be restarted from scratch - safer than re-running watch, in case of an error)
         print ("INFO: re-submitting watch request",file=sys.stderr)
