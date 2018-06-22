@@ -1,0 +1,7 @@
+#/bin/sh
+
+# this re-runs the daemon continuously, in case it exits
+
+while true ; do
+   python3 w2.py
+done

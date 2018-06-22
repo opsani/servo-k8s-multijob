@@ -1,0 +1,24 @@
+apiVersion: apps/v1beta1
+kind: Deployment
+metadata:
+  initializers:
+    pending: []
+  labels:
+    app: servo-k8s-multijob
+  name: servo-k8s-multijob
+spec:
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: servo-k8s-multijob
+      name: servo-k8s-multijob
+    spec:
+      serviceAccountName: opsani-servo
+      containers:
+        - name: servo
+          image: EDIT-ME/EDIT-ME:latest
+          imagePullPolicy: Always
+          env:
+            - { "name":"OPTUNE_AUTH_TOKEN", "value":"EDIT-ME!!!" }
+            - { "name":"OPTUNE_ACCOUNT", "value":"EDIT-ME!" }

@@ -1,0 +1,31 @@
+---
+# used to grant the initializer controller pod permission to see and patch pods in all namespaces
+# (so it can remove the pending initializer annotation - the initializers are applied without regard
+# to namepsace, so we cannot limit this to a single namespace)
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  # "namespace" omitted since ClusterRoles are not namespaced
+  name: opsani-servo-role
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "watch", "list", "patch"]
+---
+# this grants 'opsani-servo-role' to the 'opsani-servo' service account
+# equivalent cmd: kubectl create clusterrolebinding opsani-servo-access --clusterrole=opsani-servo-role --serviceaccount=default:opsani-servo
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: opsani-servo-access
+subjects:
+ -
+#   apiGroup: rbac.authorization.k8s.io
+    kind: ServiceAccount
+    name: opsani-servo
+# namespace should match the namespace where the account was created
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: opsani-servo-role
+  apiGroup: rbac.authorization.k8s.io
