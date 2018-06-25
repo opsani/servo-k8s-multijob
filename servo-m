@@ -2,6 +2,13 @@
 
 # this re-runs the daemon continuously, in case it exits
 
+
+# if we get signalled, signal sub-process, so it doesn't get SIGKILL
+trap 'kill $pid ; sleep 2 ; exit ;' TERM
+trap 'kill -INT $pid; sleep 2; exit ;' INT
+
 while true ; do
-   python3 w2.py
+   python3 w2.py &
+   pid=$!
+   wait
 done

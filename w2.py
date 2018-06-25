@@ -17,6 +17,11 @@ import signal
 # 'compact' format json encode (no spaces)
 json_enc = json.JSONEncoder(separators=(",",":")).encode
 
+# debug
+def dprint(*args):
+    print(*args, file=sys.stderr)
+    sys.stderr.flush()
+
 # === config ==============
 # defaults
 cfg = {
@@ -24,7 +29,8 @@ cfg = {
     "account" : None,
     "auth_token" : None,
     "send_timeout" : 10,
-    "namespaces" : "default"
+    "namespaces" : "default",
+    "appid" : "spec/containers/0/env/[JOBID]"
 }
 
 # update from env
@@ -32,9 +38,16 @@ cfg["url_pattern"] = os.environ.get("OPTUNE_URL",cfg["url_pattern"])
 cfg["account"] = os.environ.get("OPTUNE_ACCOUNT",cfg["account"])
 cfg["auth_token"] = os.environ.get("OPTUNE_AUTH_TOKEN",cfg["auth_token"])
 cfg["namespaces"] = os.environ.get("POD_NAMESPACES",cfg["namespaces"])
+cfg["appid"] = os.environ.get("OPTUNE_APP_ID",cfg["appid"])
 
 # split into array for easy use
 cfg["namespaces"] = cfg["namespaces"].split(",")
+
+try:
+    debug = os.environ.get("OPTUNE_DEBUG",0)
+    debug = int(debug)
+except Exception:
+    debug = 0
 
 def k_get(namespace, qry):
     '''run kubectl get and return parsed json output'''
@@ -87,19 +100,42 @@ def check_and_patch(obj, jobid):
 
     # if one of 'our' pods, apply other changes that we want
     if jobid is not None:
-        print("starting {}".format(obj["metadata"]["name"]),file=sys.stderr)
+        if debug>2: dprint("starting {}".format(obj["metadata"]["name"]))
         # patch.append(...) # TODO: append other changes
         pass # do nothing for now
 
     patch_str = json_enc(patch)
     k_patch_json(obj["metadata"]["namespace"], "pod", obj["metadata"]["name"], patch_str)
 
-def getenv(envarray, key):
+def getenv(envarray, key, keyname="name", valname="value"):
     """get a value from a k8s "env" object (array of {"name":x,"value":y}); return None if not found"""
     for e in envarray:
-        if e["name"] == key:
-            return e["value"]
+        if e[keyname] == key:
+            return e[valname]
     return None
+
+def qry(o,q):
+    """pick a data item from a nested data structure, based on a filename-like query string
+    (a simple replacement for tools like jq)"""
+    try:
+        for e in q.split("/"):
+            if not e: continue # skip empty (e.g., leading or duplicate "/")
+            if e[0] == "[": # special query [q,k,v]: find "k"==q in array of {"k":x,"v":y} items
+                a = e[1:-1].split(",")
+                if len(a) == 1: a += ["name","value"]
+                k,kn,vn = a
+                # assert a is list
+                o = getenv(o, k, kn, vn)
+            elif isinstance(o,dict):
+                o = o[e]
+            elif isinstance(o,list):
+                o = o[int(e)]
+            else:
+                # print(e, type(o), o)
+                raise ValueError
+        return o
+    except Exception:
+        return None
 
 def get_jobid(obj):
     """check if the k8s object is one of those we care about and return the configured JOBID env variable value if so, otherwise return None.
@@ -108,34 +144,37 @@ def get_jobid(obj):
 
     if obj["metadata"]["namespace"] not in cfg["namespaces"]:
         return None
-    return getenv( obj["spec"]["containers"][0].get("env", []), "JOBID" )
+    return qry(obj, cfg["appid"])
 
 
 iso_z_fmt = "%Y-%m-%dT%H:%M:%SZ"
 
 
+
 def report(jobid, obj, m):
     """send a 'measure' event for a job completion"""
-
 
 # d = either data from measure() or {status:failed, message:"..."}
     d = { "metrics" : m }
     d["annotations"] = { "resources": json_enc(obj["spec"]["containers"][0].get("resources",{})), "exitcode" : obj["status"]["containerStatuses"][0]["state"]["terminated"]["exitCode"] }
-    post = {"event":"MEASUREMENT", "param" : d}
-    # (TODO: this might need to be done in a separate thread, not to block the watch loop ; not critical if we use a short timeout here ; )
-    print("POST", json_enc(post), file=sys.stderr)
+    send("MEASUREMENT", jobid, d)
 
-# time curl -X POST -H 'Content-type: application/json'  -H 'Authorization: Bearer danuhBkOxjrexQuAksmRyQftRMkn2EyM' https://us-central1-optune-saas-collect.cloudfunctions.net/metrics/app1/servo -d @/tmp/payload
+def send(event, app_id, d):
+    post = {"event":event, "param" : d}
+    # (TODO: this might need to be done in a separate thread, not to block the watch loop ; not critical if we use a short timeout here ; )
+    if debug>1: dprint("POST", json_enc(post))
+
+# time curl -X POST -H 'Content-type: application/json'  -H 'Authorization: Bearer <token>' https://us-central1-optune-saas-collect.cloudfunctions.net/metrics/app1/servo -d @/tmp/payload
     args = {}
     if cfg["auth_token"]:
         args["headers"] = {"Authorization": "Bearer " + cfg["auth_token"] }
     try:
-        url = cfg["url_pattern"].format(app_id=jobid, acct=cfg["account"])
+        url = cfg["url_pattern"].format(app_id=app_id, acct=cfg["account"])
         r = requests.post(url,json=post,timeout=cfg["send_timeout"], **args)
         if not r.ok: # http errors don't raise exception
-            print("{} {} for url '{}', h={}".format(r.status_code, r.reason, r.url, repr(r.request.headers)))
+            if debug>0: dprint("{} {} for url '{}', h={}".format(r.status_code, r.reason, r.url, repr(r.request.headers)))
     except Exception as x: # connection errors
-        print( str(x), file = sys.stderr )
+        if debug>0: dprint( str(x) )
 
 
 # track pods that we see entering "terminated" state (used to avoid sending a report more than once); entries are cleared from this map on a DELETED event
@@ -150,7 +189,7 @@ def watch1(ln):
 
     jobid = get_jobid(obj)
 
-    print("watched obj {}: {}".format(c["type"], obj["metadata"]["name"]), file=sys.stderr)
+    if debug>1: dprint("watched obj {}: {}".format(c["type"], obj["metadata"]["name"]))
 
     if c["type"] == "DELETED" and jobid is not None:
         g_pods.pop("{}/{}".format(obj["metadata"]["namespace"],obj["metadata"]["name"]),None)
@@ -220,7 +259,7 @@ def run_watch(v, p_line):
                     eof_stdout = True
                     continue
                 stdout_line = l.strip().decode("UTF-8") # there will always be a complete line, driver writes one line at a time
-                print('STDOUT:', stdout_line) # DEBUG FIXME
+                if debug>4: dprint('STDOUT:', stdout_line) # DEBUG FIXME
                 if not stdout_line:
                     continue # ignore blank lines (shouldn't be output, though)
                 try:
@@ -246,8 +285,11 @@ def run_watch(v, p_line):
 
     if rc == 1 and len(stderr) == 1 and "unexpected EOF" in stderr[0]:
         return 0 # this is OK, it times out after 5 minutes
-    print("exited, code=", rc, file=sys.stderr) # DEBUG
-    print("".join(stderr))
+    if debug>0: dprint("kubectl exited, code=", rc) # DEBUG
+    if debug>1:
+        stderr = "".join(stderr)
+        dprint(stderr)
+        send("diag", "_global_", {"reason":"kubectl watch", "stderr": stderr[:2000]})
     return rc
 
 
@@ -256,9 +298,9 @@ def watch():
     for p in pods.get("items", []): # should exist?
         jobid = get_jobid(p)
         if jobid is None:
-            print("existing other obj: {}".format(p["metadata"]["name"]), file=sys.stderr) # DEBUG
+            if debug>3: dprint("existing other obj: {}".format(p["metadata"]["name"])) # DEBUG
         else:
-            print("existing job obj: {}".format(p["metadata"]["name"]), file=sys.stderr) # DEBUG
+            if debug>3: dprint("existing job obj: {}".format(p["metadata"]["name"])) # DEBUG
 
         check_and_patch(p, jobid)
 
@@ -266,7 +308,7 @@ def watch():
         r = run_watch(pods["metadata"]["resourceVersion"], watch1)
         if r:
             return # exit (we'll be restarted from scratch - safer than re-running watch, in case of an error)
-        print ("INFO: re-submitting watch request",file=sys.stderr)
+        if debug>4: dprint ("INFO: re-submitting watch request")
 
 
 def intr(sig_num, frame):
@@ -275,14 +317,21 @@ def intr(sig_num, frame):
 
     if g_p:
         g_p.terminate()
-    else:
-        os.kill(0, sig_num) # note this loses the frame where the original signal was caught
-        # sys.exit(0)
+    send("GOODBYE", "_global_", {"account":cfg["account"], "reason":"signal {}".format(sig_num)})
+    os.kill(0, sig_num) # note this loses the frame where the original signal was caught
+    # or sys.exit(0)
 
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, intr)
     signal.signal(signal.SIGINT, intr)
 
-    print(repr(cfg),file=sys.stderr) #DEBUG
-    watch()
+#    dprint(repr(cfg)) #DEBUG
+    send("HELLO", "_global_",{"account":cfg["account"]}) # NOTE: (here and in other msgs) acct not really needed, it is part of the URL, to be removed
+    try:
+        watch()
+    except Exception as x:
+        send("GOODBYE", "_global_", {"account":cfg["account"], "reason":str(x) })
+
+    # TODO send pod uuid (catch duplicates)
+    # diag event (exceptional cases)

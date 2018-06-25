@@ -27,6 +27,8 @@ OPTUNE\_AUTH\_TOKEN a 'Bearer' token to send with the post request. If this is n
 
 POD\_NAMESPACES a comma-separated list of namespaces to watch. If not set, "default" is assumed.
 
+OPTUNE\_APP\_ID the location of a string value in the pod object that is recognized as the 'application ID'. This is specified as a filepath-like string. Each path element is a map key or array index to use in a sequence to descend to the required value. A path element in the form [key] is used to search an array containing maps in the form {"name":k, "value":v} (as used in the container spec's 'env' object). The default is: `"spec/containers/0/env/[JOBID]"`.
+
 ## Example configuration for running in a k8s deployment
 
 The `example/` directory contains files that can be used to configure and run the daemon as a deployment on your k8s cluster.
