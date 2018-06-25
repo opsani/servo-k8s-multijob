@@ -183,9 +183,14 @@ g_pods = {}
 def watch1(ln):
     c = json.loads(ln)
     obj = c["object"]
+    if c["type"] == "ERROR":
+        if debug>2: dprint("watch err: ", ln) # DEBUG REMOVE ME TODO
+        return None # likely 'version too old' - trigger restart
+        # {"type":"ERROR","object":{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"too old resource version: 1 (3473)","reason":"Gone","code":410}}
+    v = obj["metadata"]["resourceVersion"]
     if obj["kind"] != "Pod":
         # warn, shouldnt happen
-        return
+        return v
 
     jobid = get_jobid(obj)
 
@@ -195,7 +200,7 @@ def watch1(ln):
         g_pods.pop("{}/{}".format(obj["metadata"]["namespace"],obj["metadata"]["name"]),None)
 
     if not c["type"] in ("ADDED", "MODIFIED"):
-        return # ignore delete and other changes
+        return v # ignore delete and other changes
 
     check_and_patch(obj, jobid)
 
@@ -220,6 +225,7 @@ def watch1(ln):
                     pass
                 report(jobid, obj, m )
 
+    return v
 
 # global var storing the external 'kubectl' process obj, used to terminate it when
 # we get INTR or TERM singal.
@@ -268,7 +274,8 @@ def run_watch(v, p_line):
                     proc.terminate()
                     # TODO: handle exception in json.loads?
                     raise
-                p_line(stdout_line)
+                v = p_line(stdout_line)
+                if v is None: return 1, v # failure - return to trigger a new 'get' of all pods
         if w:
             l = min(getattr(select,'PIPE_BUF',512), len(stdin)) # write with select.PIPE_BUF bytes or less should not block
             if not l: # done sending stdin
@@ -284,13 +291,13 @@ def run_watch(v, p_line):
     g_p = None
 
     if rc == 1 and len(stderr) == 1 and "unexpected EOF" in stderr[0]:
-        return 0 # this is OK, it times out after 5 minutes
+        return 0, v # this is OK, it times out after 5 minutes
     if debug>0: dprint("kubectl exited, code=", rc) # DEBUG
     if debug>1:
         stderr = "".join(stderr)
         dprint(stderr)
-        send("diag", "_global_", {"reason":"kubectl watch", "stderr": stderr[:2000]})
-    return rc
+        send("DIAG", "_global_", {"reason":"kubectl watch", "stderr": stderr[:2000]})
+    return rc, v
 
 
 def watch():
@@ -304,11 +311,13 @@ def watch():
 
         check_and_patch(p, jobid)
 
+    v = pods["metadata"]["resourceVersion"]
+    if debug>3: print("INFO: watch",v)
     while True:
-        r = run_watch(pods["metadata"]["resourceVersion"], watch1)
+        r, v = run_watch(v, watch1)
         if r:
             return # exit (we'll be restarted from scratch - safer than re-running watch, in case of an error)
-        if debug>4: dprint ("INFO: re-submitting watch request")
+        if debug>3: dprint ("INFO: resubmit watch", v)
 
 
 def intr(sig_num, frame):
@@ -330,6 +339,7 @@ if __name__ == "__main__":
     send("HELLO", "_global_",{"account":cfg["account"]}) # NOTE: (here and in other msgs) acct not really needed, it is part of the URL, to be removed
     try:
         watch()
+        send("GOODBYE", "_global_", {"account":cfg["account"], "reason":"exit" }) # happens if we missed too many events and need to re-read the pods list; TODO: handle this internally without exiting
     except Exception as x:
         send("GOODBYE", "_global_", {"account":cfg["account"], "reason":str(x) })
 
