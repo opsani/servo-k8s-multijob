@@ -22,6 +22,9 @@ def dprint(*args):
     print(*args, file=sys.stderr)
     sys.stderr.flush()
 
+# === const
+INITIALIZER_NAME="initcfg.optune.io"
+
 # === config ==============
 # defaults
 cfg = {
@@ -80,8 +83,18 @@ def k_patch_json(namespace, typ, obj, patchstr):
     r = json.loads(r)
     return r
 
+def update(obj, adj):
+    """prepare updates for a tracked k8s object 'obj', in the form of a patch.
+    """
+    pass
 
 def check_and_patch(obj, jobid):
+    """Test if the monitored object 'obj' has a pending initializer that matches our initializer name.
+    If it does, patch it. If the object is one of 'ours', we apply all scheduled changes to it.
+    If it is not, only the pending initializers list is patched.
+    This should be called for *every* creation or change of an object with the same type as the one
+    for which our initializer was configured.
+    """
     if "initializers" not in obj["metadata"]:
 #        print("   no initializers", file=sys.stderr) # DEBUG
         return
@@ -91,7 +104,7 @@ def check_and_patch(obj, jobid):
 #        print("   initializers empty", file=sys.stderr) # DEBUG
         return # empty list
 
-    if pending[0]["name"] != "initcfg.optune.io":
+    if pending[0]["name"] != INITIALIZER_NAME:
 #        print("   not our turn, current list:", repr(pending), file=sys.stderr) # DEBUG
         return # not our
 
@@ -99,13 +112,42 @@ def check_and_patch(obj, jobid):
     patch = [{"op": "remove", "path": "/metadata/initializers/pending/0"}]
 
     # if one of 'our' pods, apply other changes that we want
+    ev = None
     if jobid is not None:
         if debug>2: dprint("starting {}".format(obj["metadata"]["name"]))
+        r = send("WHATS_NEXT", jobid, None)
+        # DEBUG, FIXME:
+        if not r:
+            if debug>3: dprint("whats_next req failed, assuming 'measure'")
+        # if not r: error (=None) or no data (={}), assume we got 'measure' (do nothing now, run the job)
+        if r:
+            cmd = r["cmd"]
+            if cmd == "DESCRIBE":
+                if debug>0: dprint("describe cmd not implemented")
+                d = query(obj, None) # NOTE no config support for now
+                send("DESCRIPTION", jobid, d) # TODO post to a thread, not to block operation here
+                pass
+            elif cmd == "ADJUST":
+                # prepare updates and add them to the patch
+                if debug>0: dprint("adjust cmd not implemented")
+                u = update(obj, r["param"])
+                ev = "ADJUSTMENT" # send evt when patch is done
+                pass
+            elif cmd == "MEASURE":
+                pass # do nothing, we'll measure at the end. FIXME: no progress reports! (we *could* use the done-at estimate to predict progress and send messages while we wait for the job to run.
+            else:
+                if debug>0: dprint("remote server requested {}, not understood in the current state".format(cmd))
+
         # patch.append(...) # TODO: append other changes
         pass # do nothing for now
 
     patch_str = json_enc(patch)
     k_patch_json(obj["metadata"]["namespace"], "pod", obj["metadata"]["name"], patch_str)
+
+    if ev:
+        d = { "state" : "ok" } # FIXME, status from k_patch_json
+        send(ev, jobid, d)
+
 
 def getenv(envarray, key, keyname="name", valname="value"):
     """get a value from a k8s "env" object (array of {"name":x,"value":y}); return None if not found"""
@@ -138,8 +180,9 @@ def qry(o,q):
         return None
 
 def get_jobid(obj):
-    """check if the k8s object is one of those we care about and return the configured JOBID env variable value if so, otherwise return None.
-    the expected object type is 'pod' here, but this might change.
+    """check if the k8s object is one of those we care about and return the configured JOBID
+    env variable value if so, otherwise return None. The expected object type is 'pod' here,
+    but this might change.
     """
 
     if obj["metadata"]["namespace"] not in cfg["namespaces"]:
@@ -156,7 +199,9 @@ def report(jobid, obj, m):
 
 # d = either data from measure() or {status:failed, message:"..."}
     d = { "metrics" : m }
-    d["annotations"] = { "resources": json_enc(obj["spec"]["containers"][0].get("resources",{})), "exitcode" : obj["status"]["containerStatuses"][0]["state"]["terminated"]["exitCode"] }
+    d["annotations"] = {
+       "resources": json_enc(obj["spec"]["containers"][0].get("resources",{})),
+       "exitcode" : obj["status"]["containerStatuses"][0]["state"]["terminated"]["exitCode"] }
     send("MEASUREMENT", jobid, d)
 
 def send(event, app_id, d):
@@ -165,6 +210,7 @@ def send(event, app_id, d):
     if debug>1: dprint("POST", json_enc(post))
 
 # time curl -X POST -H 'Content-type: application/json'  -H 'Authorization: Bearer <token>' https://us-central1-optune-saas-collect.cloudfunctions.net/metrics/app1/servo -d @/tmp/payload
+    r = None
     args = {}
     if cfg["auth_token"]:
         args["headers"] = {"Authorization": "Bearer " + cfg["auth_token"] }
@@ -176,6 +222,12 @@ def send(event, app_id, d):
     except Exception as x: # connection errors
         if debug>0: dprint( str(x) )
 
+    if not r: return None # error
+
+    try:
+        return r.json()
+    except Exception: # no json data
+        return {}
 
 # track pods that we see entering "terminated" state (used to avoid sending a report more than once); entries are cleared from this map on a DELETED event
 g_pods = {}
@@ -296,7 +348,7 @@ def run_watch(v, p_line):
     if debug>1:
         stderr = "".join(stderr)
         dprint(stderr)
-        send("DIAG", "_global_", {"reason":"kubectl watch", "stderr": stderr[:2000]})
+        send("DIAG", "_global_", {"account":cfg["account"], "reason":"kubectl watch", "stderr": stderr[:2000]})
     return rc, v
 
 
@@ -329,6 +381,66 @@ def intr(sig_num, frame):
     send("GOODBYE", "_global_", {"account":cfg["account"], "reason":"signal {}".format(sig_num)})
     os.kill(0, sig_num) # note this loses the frame where the original signal was caught
     # or sys.exit(0)
+
+# ===
+# bits from servo-k8s
+def numval(v,min,max,step=1):
+    """shortcut for creating linear setting descriptions"""
+    return {"value":v,"min":min,"max":max, "step":step, "type": "range"}
+
+Gi=1024*1024*1024
+MAX_MEM=1*Gi
+MAX_CPU=3.5
+
+def cpuunits(s):
+    '''convert a string for CPU resource (with optional unit suffix) into a number'''
+    if s[-1] == "m": # there are no units other than 'm' (millicpu)
+        return ( float(s[:-1])/1000.0 )
+    else:
+        return (float(s))
+
+# valid mem units: E, P, T, G, M, K, Ei, Pi, Ti, Gi, Mi, Ki
+mumap = {"E":1000**6,  "P":1000**5,  "T":1000**4,  "G":1000**3,  "M":1000**2,  "K":1000,
+         "Ei":1024**6, "Pi":1024**5, "Ti":1024**4, "Gi":1024**3, "Mi":1024**2, "Ki":1024}
+def memunits(s):
+    '''convert a string for memory resource (with optional unit suffix) into a number'''
+    for u,m in mumap.items():
+        if s.endswith(u):
+            return ( float(s[:-len(u)]) * m )
+    return (float(s))
+
+def query(obj,desc=None):
+    """create a response to 'describe' cmd from k8s pod desc and optional custom properties desc """
+    # this is a simplified version compared to what the k8s servo has (single container only); if we change it to multiple containers, they will be the app's components (here the app is a single pod, unlike servo-k8s where 'app = k8s deployment'
+    if not desc:
+        desc = {"application":{}}
+    elif not desc.get("application"):
+        desc["application"] = {}
+    comps = desc["application"].setdefault("components", {})
+
+    c = obj["spec"]["containers"][0]
+    cn = c["name"]
+    comp=comps.setdefault(cn, {})
+    settings = comp.setdefault("settings", {})
+    r = c.get("resources")
+    if r:
+        settings["mem"] = numval(memunits(r.get("limits",{}).get("memory","0")), 0, MAX_MEM, MEM_STEP) # (value,min,max,step)
+        settings["cpu"] = numval(cpuunits(r.get("limits",{}).get("cpu","0")), 0, MAX_CPU, CPU_STEP) # (value,min,max,step)
+    for ev in c.get("env",[]):
+                # skip env vars that match the pre-defined setting names above
+                if ev["name"] in ("mem","cpu","replicas"):
+                    continue
+                if ev["name"] in settings:
+                    s = settings[ev["name"]]
+                    if s.get("type", "linear") == "linear":
+                        try:
+                            s["value"] = float(ev["value"])
+                        except ValueError:
+                            raise ConfigError("invalid value found in environment {}={}, it was expected to be numeric".format(ev["name"],ev["value"]))
+                    else:
+                        s["value"] = ev["value"]
+    return desc
+# ===
 
 
 if __name__ == "__main__":
