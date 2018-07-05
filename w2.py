@@ -24,6 +24,11 @@ def dprint(*args):
 
 # === const
 INITIALIZER_NAME="initcfg.optune.io"
+MEM_STEP=4096 # minimal useful increment in mem limit/reserve
+CPU_STEP=0.001 # 1 millicore, highest resolution supported by k8s
+Gi=1024*1024*1024
+MAX_MEM=1*Gi
+MAX_CPU=3.5
 
 # === config ==============
 # defaults
@@ -83,10 +88,60 @@ def k_patch_json(namespace, typ, obj, patchstr):
     r = json.loads(r)
     return r
 
+
+def update1(obj, path1, path2, val):
+    """ find the earliest subpath in obj starting from path1 that exists and prepare a patch that would make obj contain path1/path2 with a value of 'val'"""
+    # TODO: this works only for nested dicts for now; to add: arrays and arrays with key value (similar to k8s env array)
+    # assert path1 exists
+    tmp = qry(obj, path1)
+    if tmp is None:
+        dprint("ERR: no {} in {}".format(path1, repr(obj)))
+        return # FIXME raise Hell
+    p2 = path2.split("/")
+    if p2[0] == "": p2 = p1[1:] # remove leading /
+    left = p2[0:-1]
+    right = p2[-1]
+    o = val
+    while left:
+        t = qry(obj, path1 + "/" + "/".join(left))
+        if t is not None: # this exists, add to it
+            tmp = t
+            break
+        # not found, go back to higher level
+        o = { right : o }
+        right = left[-1]
+        left  = left[0:-1]
+    # make the update now on our copy of obj, so the next patch 'sees' the newly added elements
+    tmp[right] = o # adds or replaces it
+    path = path1 + "/" + "/".join(left+[right])
+
+    return { "op" : "add", "path" : path, "value" : o }
+
+
 def update(obj, adj):
     """prepare updates for a tracked k8s object 'obj', in the form of a patch.
     """
-    pass
+
+#FIXME: proper handling of settings that don't match the app (e.g., non-existent components, values out of range, etc.)
+    patches = []
+    if "state" in adj and "application" in adj["state"]: adj=adj["state"]
+    containers = obj["spec"]["containers"] # should be present
+    cmap = { c["name"]:n for n,c in enumerate(containers) }
+    # patch = [{"op": "remove", "path": "/metadata/initializers/pending/0"}]
+    comps = adj.get("application",{}).get("components",{})
+    for cn,c in comps.items():
+        idx = cmap[cn] #!!FIXME chk it is present!
+        for sn,s in c.get("settings",{}).items():
+            if sn in ("mem","cpu"): # update resources
+                path1 = "/spec/containers/{}".format(idx) # this part should exist
+                path2 = "resources/limits/"
+                if sn == "mem": path2 += "memory"
+                else: path2 += "cpu"
+                patches.append(update1(obj, path1, path2, s["value"]))
+            # else: FIXME not implemented - other settings
+
+    return patches
+
 
 def check_and_patch(obj, jobid):
     """Test if the monitored object 'obj' has a pending initializer that matches our initializer name.
@@ -112,41 +167,49 @@ def check_and_patch(obj, jobid):
     patch = [{"op": "remove", "path": "/metadata/initializers/pending/0"}]
 
     # if one of 'our' pods, apply other changes that we want
-    ev = None
     if jobid is not None:
         if debug>2: dprint("starting {}".format(obj["metadata"]["name"]))
-        r = send("WHATS_NEXT", jobid, None)
-        # DEBUG, FIXME:
-        if not r:
-            if debug>3: dprint("whats_next req failed, assuming 'measure'")
-        # if not r: error (=None) or no data (={}), assume we got 'measure' (do nothing now, run the job)
-        if r:
-            cmd = r["cmd"]
-            if cmd == "DESCRIBE":
-                if debug>0: dprint("describe cmd not implemented")
-                d = query(obj, None) # NOTE no config support for now
-                send("DESCRIPTION", jobid, d) # TODO post to a thread, not to block operation here
-                pass
-            elif cmd == "ADJUST":
-                # prepare updates and add them to the patch
-                if debug>0: dprint("adjust cmd not implemented")
-                u = update(obj, r["param"])
-                ev = "ADJUSTMENT" # send evt when patch is done
-                pass
-            elif cmd == "MEASURE":
-                pass # do nothing, we'll measure at the end. FIXME: no progress reports! (we *could* use the done-at estimate to predict progress and send messages while we wait for the job to run.
+        fake_sleep = False
+        u = None
+        while True:
+            r = send("WHATS_NEXT", jobid, None)
+            # if not r: error (=None) or no data (={}), assume we got 'measure' (do nothing now, run the job)
+            if r:
+                cmd = r["cmd"]
+                if cmd == "DESCRIBE":
+                    d = query(obj, None) # NOTE no config support for now
+                    d["metrics"] = { "duration": { "unit":"s"}, "est_duration": { "unit":"s"} }
+                    d["metrics"]["perf"] = {"unit":"1/s"} # FIXME - workaround, backend wants something named 'perf'
+                    send("DESCRIPTION", jobid, d) # TODO post to a thread, not to block operation here
+                    continue
+                elif cmd == "ADJUST":
+                    # prepare updates and add them to the patch
+                    u = update(obj, r["param"])
+                    send("ADJUSTMENT", jobid, { }) # expected by the backend
+                    # NOTE FIXME: empty data sent, there's a problem with the backend otherwise
+                    continue
+                elif cmd == "MEASURE":
+                    break # do nothing, we'll measure at the end. FIXME: no progress reports! (we *could* use the done-at estimate to predict progress and send messages while we wait for the job to run.
+                elif cmd == "SLEEP": # pretend we did and re-send whats-next, hopefully will not repeat; we can't sleep here
+                    if fake_sleep:
+                        if debug>3: dprint("got 'sleep' twice, ignoring and running pod without changes")
+                        break # did sleep already, move on
+                    if debug>3: dprint("got 'sleep', ignoring")
+                    fake_sleep = True
+                    continue # re-send whats-next
+                else:
+                    if debug>0: dprint("remote server requested {}, not understood in the current state".format(cmd))
+                    break
             else:
-                if debug>0: dprint("remote server requested {}, not understood in the current state".format(cmd))
+                if debug>3: dprint("whats_next req failed, assuming 'measure'") # DEBUG, FIXME remove
+                break
 
-        # patch.append(...) # TODO: append other changes
-        pass # do nothing for now
+        if u: # apply adjustment cmd from server:
+            if debug>3: dprint("ADJ: "+json_enc(u)) #FIXME REMOVE
+            patch.append(u)
 
     patch_str = json_enc(patch)
     k_patch_json(obj["metadata"]["namespace"], "pod", obj["metadata"]["name"], patch_str)
-
-    if ev:
-        d = { "state" : "ok" } # FIXME, status from k_patch_json
-        send(ev, jobid, d)
 
 
 def getenv(envarray, key, keyname="name", valname="value"):
@@ -216,17 +279,25 @@ def send(event, app_id, d):
         args["headers"] = {"Authorization": "Bearer " + cfg["auth_token"] }
     try:
         url = cfg["url_pattern"].format(app_id=app_id, acct=cfg["account"])
-        r = requests.post(url,json=post,timeout=cfg["send_timeout"], **args)
+        for retry in (1,2,3):
+            r = requests.post(url,json=post,timeout=cfg["send_timeout"], **args)
+            if r.ok: break
+            if r.status_code != 502 and r.status_code != 503:
+                break
+            if debug>3: dprint("rq fail 50x, retry {}".format(retry))
+            time.sleep(1) # FIXME: workaround for problem in back-end
         if not r.ok: # http errors don't raise exception
             if debug>0: dprint("{} {} for url '{}', h={}".format(r.status_code, r.reason, r.url, repr(r.request.headers)))
-    except Exception as x: # connection errors
-        if debug>0: dprint( str(x) )
+    except Exception as x: # connection errors - note these aren't retried for now
+        if debug>0: dprint( "POST FAILED: " + str(x) )
 
-    if not r: return None # error
+    if not r:
+        return None # error
 
     try:
         return r.json()
-    except Exception: # no json data
+    except Exception as x: # no json data
+        if debug>0: dprint( "JSON PARSE FAILED: " + str(x) + "\n   INPUT:" + r.text )
         return {}
 
 # track pods that we see entering "terminated" state (used to avoid sending a report more than once); entries are cleared from this map on a DELETED event
@@ -270,6 +341,7 @@ def watch1(ln):
                 ce = t["finishedAt"]
                 ce = calendar.timegm(time.strptime(ce, iso_z_fmt))
                 m = { "duration": {"value":ce - cs, "unit":"s"} }
+                m["perf"] = {"value":1/float(m["duration"]["value"]), "unit":"1/s"} # FIXME - remove when backend stops requiring this
                 try: # "done-at" isn't mandatory
                     eta = int(obj["metadata"]["annotations"]["done-at"])
                     m["est_duration"] = {"value":eta - cc, "unit":"s"}
@@ -388,9 +460,6 @@ def numval(v,min,max,step=1):
     """shortcut for creating linear setting descriptions"""
     return {"value":v,"min":min,"max":max, "step":step, "type": "range"}
 
-Gi=1024*1024*1024
-MAX_MEM=1*Gi
-MAX_CPU=3.5
 
 def cpuunits(s):
     '''convert a string for CPU resource (with optional unit suffix) into a number'''
