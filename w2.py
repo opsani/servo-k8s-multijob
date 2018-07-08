@@ -57,6 +57,14 @@ try:
 except Exception:
     debug = 0
 
+# === exceptions
+class ApiError(Exception):
+    pass
+
+class UserError(Exception): # raised on invalid input data from remote OCO
+    pass
+# ===
+
 def k_get(namespace, qry):
     '''run kubectl get and return parsed json output'''
 
@@ -90,7 +98,7 @@ def k_patch_json(namespace, typ, obj, patchstr):
 
 
 def update1(obj, path1, path2, val):
-    """ find the earliest subpath in obj starting from path1 that exists and prepare a patch that would make obj contain path1/path2 with a value of 'val'"""
+    """ find the earliest subpath in obj starting from path1 that exists and prepare a patch that would make obj contain path1/path2 with a value of 'val'. This also updates obj itself so that a subsequent call will use any sub-structures created by the previous patch(es), so that it works correctly when the patches are applied in order."""
     # TODO: this works only for nested dicts for now; to add: arrays and arrays with key value (similar to k8s env array)
     # assert path1 exists
     tmp = qry(obj, path1)
@@ -130,7 +138,10 @@ def update(obj, adj):
     # patch = [{"op": "remove", "path": "/metadata/initializers/pending/0"}]
     comps = adj.get("application",{}).get("components",{})
     for cn,c in comps.items():
-        idx = cmap[cn] #!!FIXME chk it is present!
+        try:
+            idx = cmap[cn]
+        except KeyError:
+            raise UserError("application has no component '{}'".format(cn))
         for sn,s in c.get("settings",{}).items():
             if sn in ("mem","cpu"): # update resources
                 path1 = "/spec/containers/{}".format(idx) # this part should exist
@@ -184,9 +195,12 @@ def check_and_patch(obj, jobid):
                     continue
                 elif cmd == "ADJUST":
                     # prepare updates and add them to the patch
-                    u = update(obj, r["param"])
-                    send("ADJUSTMENT", jobid, { }) # expected by the backend
-                    # NOTE FIXME: empty data sent, there's a problem with the backend otherwise
+                    reply = {} # NOTE FIXME: empty data sent, there's a problem with the backend otherwise
+                    try:
+                        u = update(obj, r["param"])
+                    except Exception as x: # TODO: different handling for 'expected' errors vs random Python exceptions
+                        reply = { "status" : "failed", "message":str(x) }
+                    send("ADJUSTMENT", jobid, reply) # expected by the backend
                     continue
                 elif cmd == "MEASURE":
                     break # do nothing, we'll measure at the end. FIXME: no progress reports! (we *could* use the done-at estimate to predict progress and send messages while we wait for the job to run.
@@ -205,8 +219,7 @@ def check_and_patch(obj, jobid):
                 break
 
         if u: # apply adjustment cmd from server:
-            if debug>3: dprint("ADJ: "+json_enc(u)) #FIXME REMOVE
-            patch.append(u)
+            patch.extend(u)
 
     patch_str = json_enc(patch)
     k_patch_json(obj["metadata"]["namespace"], "pod", obj["metadata"]["name"], patch_str)
@@ -279,13 +292,13 @@ def send(event, app_id, d):
         args["headers"] = {"Authorization": "Bearer " + cfg["auth_token"] }
     try:
         url = cfg["url_pattern"].format(app_id=app_id, acct=cfg["account"])
-        for retry in (1,2,3):
+        for retry in (2,1,1):
             r = requests.post(url,json=post,timeout=cfg["send_timeout"], **args)
             if r.ok: break
             if r.status_code != 502 and r.status_code != 503:
                 break
             if debug>3: dprint("rq fail 50x, retry {}".format(retry))
-            time.sleep(1) # FIXME: workaround for problem in back-end
+            time.sleep(retry) # FIXME: workaround for problem in back-end
         if not r.ok: # http errors don't raise exception
             if debug>0: dprint("{} {} for url '{}', h={}".format(r.status_code, r.reason, r.url, repr(r.request.headers)))
     except Exception as x: # connection errors - note these aren't retried for now
