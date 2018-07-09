@@ -316,11 +316,10 @@ def send(event, app_id, d):
 # track pods that we see entering "terminated" state (used to avoid sending a report more than once); entries are cleared from this map on a DELETED event
 g_pods = {}
 
-def watch1(ln):
-    c = json.loads(ln)
+def watch1(c):
     obj = c["object"]
     if c["type"] == "ERROR":
-        if debug>2: dprint("watch err: ", ln) # DEBUG REMOVE ME TODO
+        if debug>2: dprint("watch err: ", repr(c)) # DEBUG REMOVE ME TODO
         return None # likely 'version too old' - trigger restart
         # {"type":"ERROR","object":{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"too old resource version: 1 (3473)","reason":"Gone","code":410}}
     v = obj["metadata"]["resourceVersion"]
@@ -350,8 +349,11 @@ def watch1(ln):
                 cc = calendar.timegm(time.strptime(obj["metadata"]["creationTimestamp"], iso_z_fmt))
                 t = c0state["terminated"]
                 cs = t["startedAt"]
-                cs = calendar.timegm(time.strptime(cs, iso_z_fmt))
                 ce = t["finishedAt"]
+                if cs is None or ce is None: # terminated, but did not run
+                    send("MEASUREMENT", jobid, {"status":"failed", "message":"job deleted before it ran"})
+                    return v
+                cs = calendar.timegm(time.strptime(cs, iso_z_fmt))
                 ce = calendar.timegm(time.strptime(ce, iso_z_fmt))
                 m = { "duration": {"value":ce - cs, "unit":"s"} }
                 m["perf"] = {"value":1/float(m["duration"]["value"]), "unit":"1/s"} # FIXME - remove when backend stops requiring this
@@ -411,7 +413,7 @@ def run_watch(v, p_line):
                     proc.terminate()
                     # TODO: handle exception in json.loads?
                     raise
-                v = p_line(stdout_line)
+                v = p_line(stdout)
                 if v is None: return 1, v # failure - return to trigger a new 'get' of all pods
         if w:
             l = min(getattr(select,'PIPE_BUF',512), len(stdin)) # write with select.PIPE_BUF bytes or less should not block
