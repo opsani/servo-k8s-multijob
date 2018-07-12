@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import print_function
 
+#FIXME: deployment spec: make sure only one instance is running (upgrade should tear down old pod before creating new one)
+
 import sys
 import os
 import errno
@@ -191,6 +193,7 @@ def check_and_patch(obj, jobid):
                     d = query(obj, None) # NOTE no config support for now
                     d["metrics"] = { "duration": { "unit":"s"}, "est_duration": { "unit":"s"} }
                     d["metrics"]["perf"] = {"unit":"1/s"} # FIXME - workaround, backend wants something named 'perf'
+                    d["metrics"]["cpu_time"] = {"unit":"s"} # FIXME merge
                     send("DESCRIPTION", jobid, d) # TODO post to a thread, not to block operation here
                     continue
                 elif cmd == "ADJUST":
@@ -357,6 +360,15 @@ def watch1(c):
                 ce = calendar.timegm(time.strptime(ce, iso_z_fmt))
                 m = { "duration": {"value":ce - cs, "unit":"s"} }
                 m["perf"] = {"value":1/float(m["duration"]["value"]), "unit":"1/s"} # FIXME - remove when backend stops requiring this
+                cqry = "nodes/{node}:4194/proxy/api/v1.2/containers/kubepods/{qos}/pod{pod}".format(node=obj["spec"]["nodeName"],qos=obj["status"]["qosClass"].lower(),pod=obj["metadata"]["uid"])
+                try:
+                    cadv_stats = k_get_raw("", cqry)
+                except CalledProcessError as x:
+                    if debug>0: dprint("failed to get pod stats from cadvisor:", str(x))
+                    cadv_stats = {}
+                cadv_stats = cadv_stats.get("stats",[{}])[-1] # last item
+                if "cpu" in cadv_stats:
+                    m["cpu_time"] = {"value":cadv_stats["cpu"]["usage"]["total"]/1e-9, "unit":"s"}
                 try: # "done-at" isn't mandatory
                     eta = int(obj["metadata"]["annotations"]["done-at"])
                     m["est_duration"] = {"value":eta - cc, "unit":"s"}

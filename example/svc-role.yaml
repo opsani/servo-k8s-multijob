@@ -11,6 +11,9 @@ rules:
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["initialize", "get", "watch", "list", "patch"]
+- apiGroups: [""]
+  resources: ["nodes", "nodes/proxy"]
+  verbs: ["get"]
 ---
 # this grants 'opsani-servo-role' to the 'opsani-servo' service account
 # equivalent cmd: kubectl create clusterrolebinding opsani-servo-access --clusterrole=opsani-servo-role --serviceaccount=default:opsani-servo
