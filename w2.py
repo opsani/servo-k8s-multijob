@@ -16,6 +16,9 @@ import json
 import select
 import signal
 
+import threading
+import queue
+
 # 'compact' format json encode (no spaces)
 json_enc = json.JSONEncoder(separators=(",",":")).encode
 
@@ -40,7 +43,8 @@ cfg = {
     "auth_token" : None,
     "send_timeout" : 10,
     "namespaces" : "default",
-    "appid" : "spec/containers/0/env/[JOBID]"
+    "appid" : "spec/containers/0/env/[JOBID]",
+    "sleeper_img" : "gcr.io/google_containers/pause-amd64:3.0"
 }
 
 # update from env
@@ -49,6 +53,7 @@ cfg["account"] = os.environ.get("OPTUNE_ACCOUNT",cfg["account"])
 cfg["auth_token"] = os.environ.get("OPTUNE_AUTH_TOKEN",cfg["auth_token"])
 cfg["namespaces"] = os.environ.get("POD_NAMESPACES",cfg["namespaces"])
 cfg["appid"] = os.environ.get("OPTUNE_APP_ID",cfg["appid"])
+cfg["sleeper_img"] = os.environ.get("OPTUNE_SLEEPER_IMG",cfg["sleeper_img"])
 
 # split into array for easy use
 cfg["namespaces"] = cfg["namespaces"].split(",")
@@ -182,6 +187,16 @@ def check_and_patch(obj, jobid):
     # if one of 'our' pods, apply other changes that we want
     if jobid is not None:
         if debug>2: dprint("starting {}".format(obj["metadata"]["name"]))
+
+    # inject 'sleeper' process to keep pod active after job exits
+    # NOTE container name is chosen so it sorts after most 'normal' names,
+    # not to affect the order of containers in 'containerStatuses' (this works
+    # with current k8s versions, but may not be future-compatible! Do not
+    # rely on blind access to containerStatuses[x] - always check the container
+    # name)
+        if cfg["sleeper_img"]:
+            patch.append({"op":"add", "path":"/spec/containers/-", "value" : { "image": cfg["sleeper_img"] , "name": "zzzzpause"} })
+
         fake_sleep = False
         u = None
         while True:
@@ -191,9 +206,8 @@ def check_and_patch(obj, jobid):
                 cmd = r["cmd"]
                 if cmd == "DESCRIBE":
                     d = query(obj, None) # NOTE no config support for now
-                    d["metrics"] = { "duration": { "unit":"s"}, "est_duration": { "unit":"s"} }
+                    d["metrics"] = { "duration": { "unit":"s"}, "est_duration": { "unit":"s"}, "cpu_time" : {"unit":"s"} }
                     d["metrics"]["perf"] = {"unit":"1/s"} # FIXME - workaround, backend wants something named 'perf'
-                    d["metrics"]["cpu_time"] = {"unit":"s"} # FIXME merge
                     send("DESCRIPTION", jobid, d) # TODO post to a thread, not to block operation here
                     continue
                 elif cmd == "ADJUST":
@@ -272,6 +286,13 @@ def get_jobid(obj):
 iso_z_fmt = "%Y-%m-%dT%H:%M:%SZ"
 
 
+def get_cstatus(pod, c):
+    if isinstance(c, int): # if index given, find the name
+        c = pod["spec"]["containers"][c]["name"]
+    for s in pod["status"]["containerStatuses"]:
+        if s["name"] == c:
+            return s
+    return None # not found
 
 def report(jobid, obj, m):
     """send a 'measure' event for a job completion"""
@@ -280,7 +301,7 @@ def report(jobid, obj, m):
     d = { "metrics" : m }
     d["annotations"] = {
        "resources": json_enc(obj["spec"]["containers"][0].get("resources",{})),
-       "exitcode" : obj["status"]["containerStatuses"][0]["state"]["terminated"]["exitCode"] }
+       "exitcode" : get_cstatus(obj,0)["state"]["terminated"]["exitCode"] }
     send("MEASUREMENT", jobid, d)
 
 def send(event, app_id, d):
@@ -319,6 +340,61 @@ def send(event, app_id, d):
 # track pods that we see entering "terminated" state (used to avoid sending a report more than once); entries are cleared from this map on a DELETED event
 g_pods = {}
 
+def report_worker():
+    while True:
+        obj = report_queue.get()
+        report_task(obj)
+        report_queue.task_done()
+
+# start threads to wait on the queue
+g_threads = []
+report_queue = queue.Queue()
+for t in range(4):
+    th = threading.Thread(target = report_worker)
+    th.daemon = True # allow program to exit with the thread still running
+    th.start()
+    g_threads.append(th)
+
+def report_task(obj):
+    """asynch task called to prepare and send a MEASURE report, this is called
+    from worker threads to prevent blocking the main loop, because the task
+    has to: (a) wait enough time to collect the cAdvisor stats and (b) send
+    the data over the network.
+    """
+
+    if debug>4: dprint("report task enter") # FIXME REMOVE
+    c0state = get_cstatus(obj, 0)["state"]
+    cc = calendar.timegm(time.strptime(obj["metadata"]["creationTimestamp"], iso_z_fmt))
+    t = c0state["terminated"]
+    cs = t["startedAt"]
+    ce = t["finishedAt"]
+    if cs is None or ce is None: # terminated, but did not run
+        send("MEASUREMENT", jobid, {"status":"failed", "message":"job deleted before it ran"})
+        return
+    cs = calendar.timegm(time.strptime(cs, iso_z_fmt))
+    ce = calendar.timegm(time.strptime(ce, iso_z_fmt))
+    m = { "duration": {"value":ce - cs, "unit":"s"} }
+    m["perf"] = {"value":1/float(m["duration"]["value"]), "unit":"1/s"} # FIXME - remove when backend stops requiring this
+    cqry = "nodes/{node}:4194/proxy/api/v1.2/containers/kubepods/{qos}/pod{pod}".format(node=obj["spec"]["nodeName"],qos=obj["status"]["qosClass"].lower(),pod=obj["metadata"]["uid"])
+    time.sleep(20)
+    try:
+        cadv_stats = k_get_raw("", cqry)
+    except CalledProcessError as x:
+        if debug>0: dprint("failed to get pod stats from cadvisor:", str(x))
+        cadv_stats = {}
+    cadv_stats = cadv_stats.get("stats",[{}])[-1] # last item
+    if "cpu" in cadv_stats:
+        cpu_ns =cadv_stats["cpu"]["usage"]["total"]
+        if debug>4: dprint("cpu_ns", cpu_ns)
+        m["cpu_time"] = {"value":cpu_ns/1e9, "unit":"s"}
+    try: # "done-at" isn't mandatory
+        eta = int(obj["metadata"]["annotations"]["done-at"])
+        m["est_duration"] = {"value":eta - cc, "unit":"s"}
+    except (KeyError,ValueError):
+        pass
+    report(jobid, obj, m )
+
+
 def watch1(c):
     obj = c["object"]
     if c["type"] == "ERROR":
@@ -346,35 +422,10 @@ def watch1(c):
     if jobid is not None:
         pid = "{}/{}".format(obj["metadata"]["namespace"],obj["metadata"]["name"])
         if pid not in g_pods and "containerStatuses" in obj["status"]:
-            c0state = obj["status"]["containerStatuses"][0]["state"]
+            c0state = get_cstatus(obj, 0)["state"]
             if "terminated" in c0state:
                 g_pods[pid] = True
-                cc = calendar.timegm(time.strptime(obj["metadata"]["creationTimestamp"], iso_z_fmt))
-                t = c0state["terminated"]
-                cs = t["startedAt"]
-                ce = t["finishedAt"]
-                if cs is None or ce is None: # terminated, but did not run
-                    send("MEASUREMENT", jobid, {"status":"failed", "message":"job deleted before it ran"})
-                    return v
-                cs = calendar.timegm(time.strptime(cs, iso_z_fmt))
-                ce = calendar.timegm(time.strptime(ce, iso_z_fmt))
-                m = { "duration": {"value":ce - cs, "unit":"s"} }
-                m["perf"] = {"value":1/float(m["duration"]["value"]), "unit":"1/s"} # FIXME - remove when backend stops requiring this
-                cqry = "nodes/{node}:4194/proxy/api/v1.2/containers/kubepods/{qos}/pod{pod}".format(node=obj["spec"]["nodeName"],qos=obj["status"]["qosClass"].lower(),pod=obj["metadata"]["uid"])
-                try:
-                    cadv_stats = k_get_raw("", cqry)
-                except CalledProcessError as x:
-                    if debug>0: dprint("failed to get pod stats from cadvisor:", str(x))
-                    cadv_stats = {}
-                cadv_stats = cadv_stats.get("stats",[{}])[-1] # last item
-                if "cpu" in cadv_stats:
-                    m["cpu_time"] = {"value":cadv_stats["cpu"]["usage"]["total"]/1e-9, "unit":"s"}
-                try: # "done-at" isn't mandatory
-                    eta = int(obj["metadata"]["annotations"]["done-at"])
-                    m["est_duration"] = {"value":eta - cc, "unit":"s"}
-                except (KeyError,ValueError):
-                    pass
-                report(jobid, obj, m )
+                report_queue.put(obj) # send it off to a thread to wait for pod stats and send a report
 
     return v
 
