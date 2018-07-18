@@ -5,6 +5,11 @@ metadata:
     pending: []
   labels:
     app: servo-k8s-multijob
+    # the label below is matched by metainit. If using metainit,
+    # ensure the label key here is the same as the one given to metainit as
+    # argument. If metainit is started without arguments, it will use the
+    # default: "k8s.opsani.io/initializer"
+    "k8s.opsani.io/initializer": ""
   name: servo-k8s-multijob
 spec:
   replicas: 1
