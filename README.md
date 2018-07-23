@@ -29,7 +29,8 @@ POD\_NAMESPACES a comma-separated list of namespaces to watch. If not set, "defa
                                                                                `
 OPTUNE\_APP\_ID the location of a string value in the pod object that is recognized as the 'application ID'. This is specified as a filepath-like string. Each path element is a map key or array index to use in a sequence to descend to the required value. A path element in the form [key] is used to search an array containing maps in the form {"name":k, "value":v} (as used in the container spec's 'env' object). The default is: `"spec/containers/0/env/[JOBID]"`.
 
-OPTUNE\_SLEEPER\_IMG (optional) docker image to run as an additional container in the watched pods. This image should run a process that sleeps forever. This is used to keep the pod 'active' even after its one-time workload container has exited, so that pod statistics can be collected 'post-mortem'. It may also be used to delay a 'delete pod' command and allow the stats collection to occur - this can be done by running a process that doesn't exit on SIGTERM immediately, but waits for 30sec or more after receiving the signal.
+OPTUNE\_SLEEPER\_IMG (optional) docker image to run as an additional container in the watched pods. This image should run a process that sleeps forever. This is used to keep the pod 'active' even after its one-time workload container has exited, so that pod statistics can be collected 'post-mortem'. It may also be used to delay a 'delete pod' command and allow the stats collection to occur - this can be done by running a process that doesn't exit on SIGTERM immediately, but waits for 30sec or more after receiving the signal or ignores it altogether and waits for Kubernetes to time out and kill the process.
+An example of a "SIGTERM-resistant" docker image can be built using the file `noterm/Dockerfile`.
 
 ## Example configuration for running in a k8s deployment
 
