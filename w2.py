@@ -362,6 +362,7 @@ def report_task(obj):
     the data over the network.
     """
 
+    jobid = get_jobid(obj)
     if debug>4: dprint("report task enter") # FIXME REMOVE
     c0state = get_cstatus(obj, 0)["state"]
     cc = calendar.timegm(time.strptime(obj["metadata"]["creationTimestamp"], iso_z_fmt))
