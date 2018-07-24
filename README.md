@@ -58,7 +58,10 @@ Create the deployment:
 
 ## Enabling Initializer Configuration
 
-(EXPERIMENTAL, NOT NEEDED to run the current version of this servo)
+NOTES:
+
+- the initializer configuration is not required if running the driver in 'monitor-only' mode (though it will not be able to hold on to exited pods and measure used CPU time in this case).
+- if initializer configuration is set up, ensure that the driver is running with sufficient access to the Kubernetes API to be able to initialize the pods. See the `example/svc-*.yaml` files, they can be used to configure a service account for the driver's pod with the correct access privileges.
 
 The servo daemon recognizes initializer configuration named `initcfg.optune.io`, if one is present in metadata/initializers/pending in newly-created pods.
 
