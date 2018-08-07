@@ -11,9 +11,21 @@ The daemon is primarily intended to be run in a container. For convenient access
 
 From the root directory of this repo, run (change the -t value as desired, it should be a tag that you can push to your Docker registry):
 
-    tag=$docker-acct/servo-k8s-multijob:latest
+    tag=$docker_acct/servo-k8s-multijob:latest
     docker build -t "$tag" .
     docker push "$tag"
+
+## Building the  optional 'monitor' container
+
+This image can be used if it is desired to collect additional process stats from the jobs. It is added as an additional container to the pods recognized as being 'jobs'.
+
+From the `mon` directory of this repo, run (change the -t value as desired, it should be a tag that you can push to your Docker registry):
+
+    tag=$docker_acct/podmon:latest
+    docker build -t "$tag" .
+    docker push "$tag"
+
+Use the created image by setting `OPTUNE_SLEEPER_IMG` to the name of the image built from `mon` (see Configuration below).
 
 ## Configuration
 
@@ -29,8 +41,7 @@ POD\_NAMESPACES a comma-separated list of namespaces to watch. If not set, "defa
                                                                                `
 OPTUNE\_APP\_ID the location of a string value in the pod object that is recognized as the 'application ID'. This is specified as a filepath-like string. Each path element is a map key or array index to use in a sequence to descend to the required value. A path element in the form [key] is used to search an array containing maps in the form {"name":k, "value":v} (as used in the container spec's 'env' object). The default is: `"spec/containers/0/env/[JOBID]"`.
 
-OPTUNE\_SLEEPER\_IMG (optional) docker image to run as an additional container in the watched pods. This image should run a process that sleeps forever. This is used to keep the pod 'active' even after its one-time workload container has exited, so that pod statistics can be collected 'post-mortem'. It may also be used to delay a 'delete pod' command and allow the stats collection to occur - this can be done by running a process that doesn't exit on SIGTERM immediately, but waits for 30sec or more after receiving the signal or ignores it altogether and waits for Kubernetes to time out and kill the process.
-An example of a "SIGTERM-resistant" docker image can be built using the file `noterm/Dockerfile`.
+OPTUNE\_SLEEPER\_IMG (optional) docker image to run as an additional container in the watched pods. This image should run a process that sleeps forever. This is used to keep the pod 'active' even after its one-time workload container has exited, so that pod statistics can be collected 'post-mortem'. It may also be used to run a 'monitor' image created from the Dockerfile found in the `mon` directory, this will extend the stats collected by adding `cpu_time` and `max_memory`. **NOTE** if using the 'monitor' image here, the environment variable `SELF_IP` should be set exactly as shown in `example/deployment.yaml`.
 
 ## Example configuration for running in a k8s deployment
 

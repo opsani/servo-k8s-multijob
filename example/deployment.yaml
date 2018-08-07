@@ -27,3 +27,6 @@ spec:
           env:
             - { "name":"OPTUNE_AUTH_TOKEN", "value":"EDIT-ME!!!" }
             - { "name":"OPTUNE_ACCOUNT", "value":"EDIT-ME!" }
+            - { "name":"POD_NAMESPACES", "value":"EDIT-ME!" }
+            # the following is required and should be kept as it is
+            - { "name":"SELF_IP", "valueFrom": { "fieldRef": { "fieldPath":"status.podIP" } }}

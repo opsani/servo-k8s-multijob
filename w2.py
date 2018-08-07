@@ -19,6 +19,11 @@ import signal
 import threading
 import queue
 
+# networking
+import socket
+import http.server
+import socketserver
+
 # 'compact' format json encode (no spaces)
 json_enc = json.JSONEncoder(separators=(",",":")).encode
 
@@ -195,7 +200,21 @@ def check_and_patch(obj, jobid):
     # rely on blind access to containerStatuses[x] - always check the container
     # name)
         if cfg["sleeper_img"]:
-            patch.append({"op":"add", "path":"/spec/containers/-", "value" : { "image": cfg["sleeper_img"] , "name": "zzzzpause"} })
+            qos = obj["status"]["qosClass"].lower()
+            uid=obj["metadata"]["uid"]
+            patch.append({"op":"add",
+                          "path":"/spec/containers/-",
+                          "value" : {
+                            "image": cfg["sleeper_img"] ,
+                            "name": "zzzzmonitor",
+                            "volumeMounts":[{"mountPath":"/rsys", "name":"rsys"}],
+                            "env":[{"name":"OPTUNE_CGROUP_PATH","value":"/kubepods/{qos}/pod{pod}".format(qos=qos,pod=uid)},
+                                   {"name":"OPTUNE_SELF_ID", "value":o2id(obj)},
+                                   {"name":"REPORT_TARGET", "value":os.environ.get("SELF_IP")}]
+                            #FIXME: get and check self_ip on start, MUST be set
+                           }
+                         })
+            patch.append({"op":"add", "path":"/spec/volumes/-", "value" : { "name" : "rsys", "hostPath" : {"path":"/sys","type":"Directory"} }})
 
         fake_sleep = False
         u = None
@@ -358,7 +377,7 @@ for t in range(4):
 def report_task(obj):
     """asynch task called to prepare and send a MEASURE report, this is called
     from worker threads to prevent blocking the main loop, because the task
-    has to: (a) wait enough time to collect the cAdvisor stats and (b) send
+    has to: (a) wait enough time to collect the cgroup stats and (b) send
     the data over the network.
     """
 
@@ -376,24 +395,28 @@ def report_task(obj):
     ce = calendar.timegm(time.strptime(ce, iso_z_fmt))
     m = { "duration": {"value":ce - cs, "unit":"s"} }
     m["perf"] = {"value":1/float(m["duration"]["value"]), "unit":"1/s"} # FIXME - remove when backend stops requiring this
-    cqry = "nodes/{node}:4194/proxy/api/v1.2/containers/kubepods/{qos}/pod{pod}".format(node=obj["spec"]["nodeName"],qos=obj["status"]["qosClass"].lower(),pod=obj["metadata"]["uid"])
-    time.sleep(20)
-    try:
-        cadv_stats = k_get_raw("", cqry)
-    except CalledProcessError as x:
-        if debug>0: dprint("failed to get pod stats from cadvisor:", str(x))
-        cadv_stats = {}
-    cadv_stats = cadv_stats.get("stats",[{}])[-1] # last item
-    if "cpu" in cadv_stats:
-        cpu_ns =cadv_stats["cpu"]["usage"]["total"]
-        if debug>4: dprint("cpu_ns", cpu_ns)
+
+    pid = o2id(obj)
+    rec = g_pods[pid] # shouldn't fail
+    c = rec["cond"]
+    with c:
+        _stats = c.wait_for(lambda: rec.get("_stats"), timeout = 30)
+
+    if _stats: # we got a report via the API, add it to the results
+        cpu_ns = _stats["cpu_time"]
+        max_usage = _stats["max_usage"] #units?? TBD
         m["cpu_time"] = {"value":cpu_ns/1e9, "unit":"s"}
+        m["max_memory"] = {"value":max_usage, "unit":"bytes"}
+    else:
+        if debug>0: dprint("failed to get cgroup pod stats")
+
     try: # "done-at" isn't mandatory
         eta = int(obj["metadata"]["annotations"]["done-at"])
         m["est_duration"] = {"value":eta - cc, "unit":"s"}
     except (KeyError,ValueError):
         pass
-    report(jobid, obj, m )
+
+    report(jobid, obj, m)
 
 
 def watch1(c):
@@ -412,7 +435,7 @@ def watch1(c):
     if debug>1: dprint("watched obj {}: {}".format(c["type"], obj["metadata"]["name"]))
 
     if c["type"] == "DELETED" and jobid is not None:
-        g_pods.pop("{}/{}".format(obj["metadata"]["namespace"],obj["metadata"]["name"]),None)
+        g_pods.pop(o2id(obj))
 
     if not c["type"] in ("ADDED", "MODIFIED"):
         return v # ignore delete and other changes
@@ -421,12 +444,13 @@ def watch1(c):
 
     # track job completion
     if jobid is not None:
-        pid = "{}/{}".format(obj["metadata"]["namespace"],obj["metadata"]["name"])
+        pid = o2id(obj)
         if pid not in g_pods and "containerStatuses" in obj["status"]:
             c0state = get_cstatus(obj, 0)["state"]
             if "terminated" in c0state:
-                g_pods[pid] = True
-                report_queue.put(obj) # send it off to a thread to wait for pod stats and send a report
+                job_completed(obj)
+                #g_pods[pid] = True
+                #report_queue.put(obj) # send it off to a thread to wait for pod stats and send a report
 
     return v
 
@@ -533,6 +557,10 @@ def intr(sig_num, frame):
     os.kill(0, sig_num) # note this loses the frame where the original signal was caught
     # or sys.exit(0)
 
+    if http_server:
+        http_server.shutdown()
+        # http_server.close() # ? needed
+
 # ===
 # bits from servo-k8s
 def numval(v,min,max,step=1):
@@ -588,6 +616,87 @@ def query(obj,desc=None):
                     else:
                         s["value"] = ev["value"]
     return desc
+
+
+def o2id(obj):
+    # FIXME: encode self ID (for now, just the pod UID)
+    return obj["metadata"]["uid"]
+    
+def job_completed(obj):
+    #
+    pid = o2id(obj)
+    c = threading.Condition()
+    g_pods[pid] = { "cond" : c }
+    # TODO: consider saving pid in obj[_pid], in case o2id() is slow
+    report_queue.put(obj) # send it off to a thread to wait for pod stats and send a report
+#    with c:
+#        c.notify()
+
+def handle_cgroup_stats(data):
+    # dprint("got post with stats", repr(data))
+    pid = data.get("id", None)
+    if not pid:
+        # invalid input if no 'id', ignore it silently
+        # dprint("no ID", pid)
+        return
+    r = g_pods.get(pid, None)
+    if not r:
+        # dprint("no match for", pid)
+        # error, we do not expect report before g_pods is updated
+        return
+ 
+    c = r["cond"]
+    with c:
+        r["_stats"] = data["stats"]
+        c.notify()
+
+# === server for receiving stats from sidecar container
+http_server = None
+http_thread = None
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    """this handler answers to POST on any URL, only the input data is used. Data
+    should be in JSON format and contain { "id":string, "stats":{stats} }"""
+    def do_POST(self):
+        cl = self.headers.get("Content-length","") # should be present - or else
+        try:
+            cl = int(cl) # will fail if the header is empty
+        except ValueError:
+            self.send_error(400, message="bad request",explain="content-length is missing or invalid")
+            return
+
+        data = self.rfile.read()
+        try:
+            data = json.loads(data)
+        except Exception as x:
+            self.send_error(400, message="bad request", explain="could not parse input as JSON data: "+str(x))
+
+        handle_cgroup_stats(data)
+
+        self.send_error(204) # instead of 200, no body needed
+        # self.end_headers() - called by send_error()
+
+    def log_request(self, code='-', size='-'):
+        pass # do nothing
+
+    def log_error(self, format, *args):
+        pass
+
+    def version_string(self):
+        return "OptuneStatsPost/1.0"
+
+class TServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    pass
+
+def run_server():
+    s = TServer(('',8080),Handler)
+    s.daemon_threads = True
+    thread = threading.Thread(target=s.serve_forever)
+    http_server = s
+    http_thread = thread
+    thread.start()
+    return s, thread
+
 # ===
 
 
@@ -595,12 +704,16 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, intr)
     signal.signal(signal.SIGINT, intr)
 
+    run_server()
+
 #    dprint(repr(cfg)) #DEBUG
     send("HELLO", "_global_",{"account":cfg["account"]}) # NOTE: (here and in other msgs) acct not really needed, it is part of the URL, to be removed
     try:
         watch()
         send("GOODBYE", "_global_", {"account":cfg["account"], "reason":"exit" }) # happens if we missed too many events and need to re-read the pods list; TODO: handle this internally without exiting
     except Exception as x:
+        import traceback #DEBUG
+        traceback.print_exc() #DEBUG
         send("GOODBYE", "_global_", {"account":cfg["account"], "reason":str(x) })
 
     # TODO send pod uuid (catch duplicates)
