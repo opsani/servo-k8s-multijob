@@ -1,8 +1,6 @@
 apiVersion: apps/v1beta1
 kind: Deployment
 metadata:
-  initializers:
-    pending: []
   labels:
     app: servo-k8s-multijob
     # the label below is matched by metainit. If using metainit,
@@ -13,11 +11,15 @@ metadata:
   name: servo-k8s-multijob
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: servo-k8s-multijob
   template:
     metadata:
       labels:
         app: servo-k8s-multijob
-      name: servo-k8s-multijob
     spec:
       serviceAccountName: opsani-servo
       containers:

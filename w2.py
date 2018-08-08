@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import print_function
 
-#FIXME: deployment spec: make sure only one instance is running (upgrade should tear down old pod before creating new one)
-
 import sys
 import os
 import errno
@@ -10,8 +8,6 @@ import subprocess
 import time
 import calendar
 
-# import re
-import requests
 import json
 import select
 import signal
@@ -20,6 +16,7 @@ import threading
 import queue
 
 # networking
+import requests
 import socket
 import http.server
 import socketserver
@@ -116,7 +113,7 @@ def update1(obj, path1, path2, val):
     tmp = qry(obj, path1)
     if tmp is None:
         dprint("ERR: no {} in {}".format(path1, repr(obj)))
-        return # FIXME raise Hell
+        return # FIXME raise H*ll
     p2 = path2.split("/")
     if p2[0] == "": p2 = p1[1:] # remove leading /
     left = p2[0:-1]
@@ -251,7 +248,7 @@ def check_and_patch(obj, jobid):
                     if debug>0: dprint("remote server requested {}, not understood in the current state".format(cmd))
                     break
             else:
-                if debug>3: dprint("whats_next req failed, assuming 'measure'") # DEBUG, FIXME remove
+                # dprint("whats_next req failed, assuming 'measure'")
                 break
 
         if u: # apply adjustment cmd from server:
@@ -325,7 +322,6 @@ def report(jobid, obj, m):
 
 def send(event, app_id, d):
     post = {"event":event, "param" : d}
-    # (TODO: this might need to be done in a separate thread, not to block the watch loop ; not critical if we use a short timeout here ; )
     if debug>1: dprint("POST", json_enc(post))
 
 # time curl -X POST -H 'Content-type: application/json'  -H 'Authorization: Bearer <token>' https://us-central1-optune-saas-collect.cloudfunctions.net/metrics/app1/servo -d @/tmp/payload
@@ -382,7 +378,6 @@ def report_task(obj):
     """
 
     jobid = get_jobid(obj)
-    if debug>4: dprint("report task enter") # FIXME REMOVE
     c0state = get_cstatus(obj, 0)["state"]
     cc = calendar.timegm(time.strptime(obj["metadata"]["creationTimestamp"], iso_z_fmt))
     t = c0state["terminated"]
@@ -422,7 +417,6 @@ def report_task(obj):
 def watch1(c):
     obj = c["object"]
     if c["type"] == "ERROR":
-        if debug>2: dprint("watch err: ", repr(c)) # DEBUG REMOVE ME TODO
         return None # likely 'version too old' - trigger restart
         # {"type":"ERROR","object":{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Failure","message":"too old resource version: 1 (3473)","reason":"Gone","code":410}}
     v = obj["metadata"]["resourceVersion"]
@@ -461,12 +455,12 @@ g_p = None
 
 def run_watch(v, p_line):
 
-    api = "/api/v1" # FIXME
+    api = "/api/v1" # FIXME (ok with current k8s, but switch to api groups later)
     qry = "pods?includeUninitialized=true&watch=1&resourceVersion="+str(v)
     tgt = "/".join( (api, qry) )
     cmd = ["kubectl", "get","--request-timeout=0", "--raw", tgt ]
 
-    stderr = [] # collect all stderr here FIXME: don't collect stderr
+    stderr = [] # collect all stderr here FIXME: maybe don't collect stderr?
     stdin = b''         # no stdin
     proc = subprocess.Popen(cmd, bufsize=0, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE)
     g_p = proc
@@ -554,12 +548,13 @@ def intr(sig_num, frame):
     if g_p:
         g_p.terminate()
     send("GOODBYE", "_global_", {"account":cfg["account"], "reason":"signal {}".format(sig_num)})
-    os.kill(0, sig_num) # note this loses the frame where the original signal was caught
-    # or sys.exit(0)
 
     if http_server:
         http_server.shutdown()
         # http_server.close() # ? needed
+
+    os.kill(0, sig_num) # note this loses the frame where the original signal was caught
+    # or sys.exit(0)
 
 # ===
 # bits from servo-k8s
@@ -717,4 +712,3 @@ if __name__ == "__main__":
         send("GOODBYE", "_global_", {"account":cfg["account"], "reason":str(x) })
 
     # TODO send pod uuid (catch duplicates)
-    # diag event (exceptional cases)
