@@ -47,7 +47,7 @@ def term_handler(n,frame):
         # use 'with' to ensure session is CLOSED before we terminate this process
         with requests.Session() as s:
             s.post(URI, json = { "id": ID, "stats": data }, timeout = POST_TIMEOUT)
-    except Exception:
+    except Exception: # nosec (ignore failure)
         pass
     sys.exit()
 

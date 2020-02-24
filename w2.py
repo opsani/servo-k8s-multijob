@@ -70,6 +70,9 @@ except Exception:
 class ApiError(Exception):
     pass
 
+class ConfigError(Exception):
+    pass
+
 class UserError(Exception): # raised on invalid input data from remote OCO
     pass
 # ===
@@ -115,7 +118,7 @@ def update1(obj, path1, path2, val):
         dprint("ERR: no {} in {}".format(path1, repr(obj)))
         return # FIXME raise H*ll
     p2 = path2.split("/")
-    if p2[0] == "": p2 = p1[1:] # remove leading /
+    if p2[0] == "": p2 = p2[1:] # remove leading /
     left = p2[0:-1]
     right = p2[-1]
     o = val
@@ -475,13 +478,13 @@ def run_watch(v, p_line):
             break
         for h in r:
             if h is proc.stderr:
-                l = h.read(4096)
+                l = h.read(4096) # noqa: E741 (l as in line)
                 if not l:
                     eof_stderr = True
                     continue
                 stderr.append(l)
             else: # h is proc.stdout
-                l = h.readline()
+                l = h.readline() # noqa: E741 (l as in line)
                 if not l:
                     eof_stdout = True
                     continue
@@ -498,7 +501,8 @@ def run_watch(v, p_line):
                 v = p_line(stdout)
                 if v is None: return 1, v # failure - return to trigger a new 'get' of all pods
         if w:
-            l = min(getattr(select,'PIPE_BUF',512), len(stdin)) # write with select.PIPE_BUF bytes or less should not block
+            # write with select.PIPE_BUF bytes or less should not block
+            l = min(getattr(select,'PIPE_BUF',512), len(stdin)) # noqa: E741 (l as in line)
             if not l: # done sending stdin
                 proc.stdin.close()
                 wi = []
